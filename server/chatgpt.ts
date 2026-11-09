@@ -271,7 +271,22 @@ export class ChatGPT {
         input: [{ role: 'user', content: r.user }], store: false, stream: true,
         text: { format: { type: 'json_schema', name: r.schemaName, strict: true, schema: r.schema } } }) });
     if (!res.ok) { let data; try { data = await res.json(); } catch {} return this.apiError(data, res.status, account, res.headers.get('x-request-id')); }
-    if (!res.body || !res.headers.get('content-type')?.includes('text/event-stream')) return fail('invalid_stream', 'ChatGPT did not return an event stream.');
+    const contentType = res.headers.get('content-type');
+    if (!res.body || !contentType?.includes('text/event-stream')) {
+      const reason = !res.body ? 'missing body' : contentType === null ? 'missing Content-Type' : 'unexpected Content-Type';
+      if (res.body) {
+        // Rejecting the format must also stop unused inference/network output.
+        // Some stream sources never settle cancellation, so bound cleanup.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            Promise.resolve().then(() => res.body!.cancel()).catch(() => {}),
+            new Promise<void>(resolve => { timer = setTimeout(resolve, 250); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      }
+      return fail('invalid_stream', `ChatGPT did not return an event stream (${reason}).`);
+    }
     let output = '';
     try {
       for await (const event of responseEvents(res.body)) {

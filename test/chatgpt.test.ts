@@ -211,6 +211,38 @@ test('JWT verification rejects signature, issuer, audience, expiry and nonce mis
   await assert.rejects(verify(await sign({}, other.privateKey), 'oaiapp_one', 'nonce'), { code: 'invalid_identity' });
 });
 
+test('invalid response formats cancel unused bodies and expose only safe reason categories', async () => {
+  for (const contentType of [undefined, 'application/json; private=DO-NOT-LOG']) {
+    let cancelled = false;
+    const f = fixture([savedAccount()]);
+    f.respond(async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode('DO-NOT-LOG')); },
+      cancel() { cancelled = true; },
+    }), { headers: contentType ? { 'Content-Type': contentType } : {} }));
+    await assert.rejects(f.app.chat(request), (e: any) => e.code === 'invalid_stream' &&
+      e.message.includes(contentType ? 'unexpected Content-Type' : 'missing Content-Type') && !e.message.includes('DO-NOT-LOG'));
+    assert.equal(cancelled, true); assert.equal(f.seen.length, 1);
+  }
+});
+
+test('missing response body is distinguished without accepting an SSE header alone', async () => {
+  const f = fixture([savedAccount()]);
+  f.respond(async () => new Response(null, { headers: { 'Content-Type': 'text/event-stream' } }));
+  await assert.rejects(f.app.chat(request), (e: any) => e.code === 'invalid_stream' && e.message.includes('missing body'));
+});
+
+test('invalid-stream cleanup is bounded when cancellation never settles or rejects', { timeout: 2000 }, async () => {
+  for (const neverSettles of [true, false]) {
+    let cancelled = false;
+    const f = fixture([savedAccount()]);
+    f.respond(async () => new Response(new ReadableStream({
+      cancel() { cancelled = true; return neverSettles ? new Promise<void>(() => {}) : Promise.reject(new Error('DO-NOT-LOG')); },
+    })));
+    await assert.rejects(f.app.chat(request), (e: any) => e.code === 'invalid_stream' && !e.message.includes('DO-NOT-LOG'));
+    assert.equal(cancelled, true);
+  }
+});
+
 
 test('direct-admission errors retain safe diagnostics without reflecting upstream bodies or credentials', async () => {
   for (const status of [401, 403, 503]) {
