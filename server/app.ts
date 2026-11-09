@@ -326,7 +326,10 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, cha
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
-      if (!localRequest(req, url.pathname === '/auth/callback', url.pathname === '/')) return send(res, 403, { error: 'Only same-origin loopback requests are allowed' });
+      // The browser retains cross-site fetch metadata through the callback's redirect.
+      // This static confirmation document exposes no account data or credential actions.
+      const publicNavigation = url.pathname === '/' || url.pathname === '/auth/chatgpt/done';
+      if (!localRequest(req, url.pathname === '/auth/callback', publicNavigation)) return send(res, 403, { error: 'Only same-origin loopback requests are allowed' });
       if (url.pathname.startsWith('/auth/') || url.pathname.startsWith('/api/chatgpt')) {
         res.setHeader('Cache-Control', 'no-store');
         res.setHeader('Referrer-Policy', 'no-referrer');

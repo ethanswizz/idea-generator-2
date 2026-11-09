@@ -51,6 +51,21 @@ test('HTTP OAuth flow binds cookie/state, scrubs callback URLs, rejects cross-or
     assert.equal(result.status, 303); assert.equal(result.headers.get('location'), '/auth/chatgpt/done');
     assert.equal(result.headers.get('referrer-policy'), 'no-referrer'); assert.equal(result.headers.get('cache-control'), 'no-store');
     assert.match(result.headers.get('set-cookie')!, /Max-Age=0/); assert.equal(exchanges, 1);
+    // Redirects retain Sec-Fetch-Site: cross-site after real OpenAI consent.
+    // Raw HTTP preserves browser navigation metadata that Node fetch normalizes.
+    const navigate = (path: string, headers = {}) => new Promise<{ status: number; body: string; headers: any }>(resolve => {
+      const req = httpRequest(base + path, { headers: { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document', ...headers } }, res => {
+        let body = ''; res.setEncoding('utf8'); res.on('data', chunk => { body += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode!, body, headers: res.headers }));
+      }); req.end();
+    });
+    const done = await navigate(result.headers.get('location')!);
+    assert.equal(done.status, 200); assert.match(done.body, /sign-in attempt finished/);
+    assert.equal(done.headers['cache-control'], 'no-store'); assert.equal(done.headers['referrer-policy'], 'no-referrer');
+    assert.ok(!done.body.includes('PRIVATE')); assert.ok(!done.body.includes('test@example.test'));
+    assert.equal((await navigate('/auth/chatgpt/done', { 'Sec-Fetch-Dest': 'iframe' })).status, 403);
+    assert.equal((await navigate('/auth/chatgpt/done', { Origin: 'https://evil.example' })).status, 403);
+    assert.equal((await navigate('/api/chatgpt/status')).status, 403);
     const status = await (await fetch(base + '/api/chatgpt/status')).text();
     assert.ok(!status.includes('PRIVATE')); assert.ok(saved.accounts[0].accessToken);
     await fetch(base + callback, { redirect: 'manual', headers: { Cookie: cookie } }); assert.equal(exchanges, 1);
