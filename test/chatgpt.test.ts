@@ -212,15 +212,15 @@ test('JWT verification rejects signature, issuer, audience, expiry and nonce mis
 });
 
 test('invalid response formats cancel unused bodies and expose only safe reason categories', async () => {
-  for (const contentType of [undefined, 'application/json; private=DO-NOT-LOG']) {
+  for (const contentType of ['application/json; private=DO-NOT-LOG', 'text/html', 'application/text/event-stream', 'text/event-stream-invalid', '']) {
     let cancelled = false;
     const f = fixture([savedAccount()]);
     f.respond(async () => new Response(new ReadableStream({
       start(controller) { controller.enqueue(new TextEncoder().encode('DO-NOT-LOG')); },
       cancel() { cancelled = true; },
-    }), { headers: contentType ? { 'Content-Type': contentType } : {} }));
+    }), { headers: { 'Content-Type': contentType } }));
     await assert.rejects(f.app.chat(request), (e: any) => e.code === 'invalid_stream' &&
-      e.message.includes(contentType ? 'unexpected Content-Type' : 'missing Content-Type') && !e.message.includes('DO-NOT-LOG'));
+      e.message.includes('unexpected Content-Type') && !e.message.includes('DO-NOT-LOG'));
     assert.equal(cancelled, true); assert.equal(f.seen.length, 1);
   }
 });
@@ -237,8 +237,56 @@ test('invalid-stream cleanup is bounded when cancellation never settles or rejec
     const f = fixture([savedAccount()]);
     f.respond(async () => new Response(new ReadableStream({
       cancel() { cancelled = true; return neverSettles ? new Promise<void>(() => {}) : Promise.reject(new Error('DO-NOT-LOG')); },
-    })));
+    }), { headers: { 'Content-Type': 'application/json' } }));
     await assert.rejects(f.app.chat(request), (e: any) => e.code === 'invalid_stream' && !e.message.includes('DO-NOT-LOG'));
+    assert.equal(cancelled, true);
+  }
+});
+
+test('missing Content-Type and normalized explicit SSE both require and accept a completed JSON stream', async () => {
+  for (const contentType of [undefined, 'text/event-stream', 'Text/Event-Stream; Charset=UTF-8']) {
+    const f = fixture([savedAccount()]);
+    f.respond(async () => {
+      const response = stream([delta, completed], true);
+      if (contentType === undefined) response.headers.delete('Content-Type');
+      else response.headers.set('Content-Type', contentType);
+      return response;
+    });
+    assert.deepEqual((await f.app.chat(request)).value, { title: 'idé' });
+    const body = JSON.parse(String(f.seen[0].options.body));
+    assert.equal(body.text.format.type, 'json_schema'); assert.equal(body.text.format.strict, true);
+    assert.equal(body.stream, true); assert.equal(body.store, false); assert.equal(f.seen.length, 1);
+  }
+});
+
+test('missing-header malformed, HTML, JSON, truncated and failed streams never succeed', async () => {
+  const bodies = [
+    'data: {malformed}\n\n', '<html>DO-NOT-LOG</html>', '{"connected":true}',
+    `data: ${JSON.stringify(delta)}\n\n`, `data: ${JSON.stringify(delta)}\n\ndata: ${JSON.stringify(completed)}`,
+    `data: ${JSON.stringify(delta)}\n\ndata: {"type":"response.incomplete"}\n\n`,
+    `data: ${JSON.stringify(delta)}\n\ndata: {"type":"error","code":"subscription_sharing_usage_limit_exceeded","message":"DO-NOT-LOG"}\n\n`,
+    `data: ${JSON.stringify(delta)}\n\ndata: {"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_unavailable"}}}\n\n`,
+    `data: ${JSON.stringify(delta)}\n\ndata: {"type":"response.completed","response":{"status":"incomplete"}}\n\n`,
+    `data: {"type":"response.output_text.delta","delta":"not JSON"}\n\ndata: ${JSON.stringify(completed)}\n\n`,
+  ];
+  for (const body of bodies) {
+    const f = fixture([savedAccount()]);
+    f.respond(async () => { const response = new Response(body); response.headers.delete('Content-Type'); return response; });
+    await assert.rejects(f.app.chat(request), (e: any) => e instanceof Error && !e.message.includes('DO-NOT-LOG'));
+    assert.equal(f.seen.length, 1);
+  }
+});
+
+test('missing-header stream parsing cancels on malformed data and completion with bounded cleanup', { timeout: 2000 }, async () => {
+  for (const malformed of [true, false]) {
+    let cancelled = false;
+    const f = fixture([savedAccount()]);
+    f.respond(async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(malformed ? 'data: invalid\n\n' : `data: ${JSON.stringify(delta)}\n\ndata: ${JSON.stringify(completed)}\n\n`)); },
+      cancel() { cancelled = true; return new Promise<void>(() => {}); },
+    })));
+    if (malformed) await assert.rejects(f.app.chat(request), { code: 'interrupted' });
+    else assert.deepEqual((await f.app.chat(request)).value, { title: 'idé' });
     assert.equal(cancelled, true);
   }
 });

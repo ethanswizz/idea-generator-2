@@ -15,6 +15,15 @@ export class ChatGPTError extends Error {
   constructor(code: string, message: string) { super(message); this.code = code; }
 }
 const fail = (code: string, message: string): never => { throw new ChatGPTError(code, message); };
+async function boundedCancel(cancel: () => Promise<unknown>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve().then(cancel).catch(() => {}),
+      new Promise<void>(resolve => { timer = setTimeout(resolve, 250); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
 const validClient = (id: string) => /^oaiapp_[A-Za-z0-9_-]{1,200}$/.test(id);
 type Attempt = { id: string; state: string; nonce: string; verifier: string; cookie: string; redirect: string; account?: Account; clientId: string; expires: number; consumed: boolean; controller: AbortController; consent: boolean };
 
@@ -272,18 +281,15 @@ export class ChatGPT {
         text: { format: { type: 'json_schema', name: r.schemaName, strict: true, schema: r.schema } } }) });
     if (!res.ok) { let data; try { data = await res.json(); } catch {} return this.apiError(data, res.status, account, res.headers.get('x-request-id')); }
     const contentType = res.headers.get('content-type');
-    if (!res.body || !contentType?.includes('text/event-stream')) {
-      const reason = !res.body ? 'missing body' : contentType === null ? 'missing Content-Type' : 'unexpected Content-Type';
+    const mime = contentType?.split(';', 1)[0].trim().toLowerCase();
+    // Some live Responses streams omit Content-Type. Accept no result until the
+    // same SSE parser, completed-status check and JSON validation succeed below.
+    if (!res.body || (contentType !== null && mime !== 'text/event-stream')) {
+      const reason = !res.body ? 'missing body' : 'unexpected Content-Type';
       if (res.body) {
         // Rejecting the format must also stop unused inference/network output.
         // Some stream sources never settle cancellation, so bound cleanup.
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-          await Promise.race([
-            Promise.resolve().then(() => res.body!.cancel()).catch(() => {}),
-            new Promise<void>(resolve => { timer = setTimeout(resolve, 250); }),
-          ]);
-        } finally { clearTimeout(timer); }
+        await boundedCancel(() => res.body!.cancel());
       }
       return fail('invalid_stream', `ChatGPT did not return an event stream (${reason}).`);
     }
@@ -330,5 +336,5 @@ export async function* responseEvents(body: ReadableStream<Uint8Array>) {
       }
       if (done) break;
     }
-  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } finally { await boundedCancel(() => reader.cancel()); reader.releaseLock(); }
 }
